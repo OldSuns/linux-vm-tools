@@ -55,6 +55,11 @@ fi
 
 cat > /etc/xrdp/startxfce.sh <<'EOF'
 #!/bin/sh
+# Clear inherited Wayland environment from the GNOME login session.
+unset WAYLAND_DISPLAY
+unset XDG_SESSION_TYPE
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=XFCE
 exec startxfce4
 EOF
 chmod 755 /etc/xrdp/startxfce.sh
