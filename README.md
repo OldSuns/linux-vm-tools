@@ -4,9 +4,11 @@ This repository is the home of a set of bash scripts that enable and configure a
 # How to use the repo
 Onboarding instructions for Ubuntu can be found on the [repo wiki](https://github.com/Microsoft/linux-vm-tools/wiki/Onboarding:-Ubuntu).
 
-## Ubuntu 26.04
+## Ubuntu and Xubuntu 26.04
 
 Ubuntu 26.04 ships GNOME 50 without an X11 session. Because Hyper-V Enhanced Session Mode through xrdp still requires Xorg, the 26.04 script installs a separate Xfce session. The normal GNOME/Wayland desktop remains installed.
+
+Xubuntu 26.04 already includes Xfce and uses the dedicated `xubuntu/26.04/install.sh` script.
 
 Run inside the Ubuntu VM:
 
@@ -14,6 +16,13 @@ Run inside the Ubuntu VM:
 git clone https://github.com/OldSuns/linux-vm-tools.git
 cd linux-vm-tools
 sudo ./ubuntu/26.04/install.sh
+sudo poweroff
+```
+
+For Xubuntu, replace the install command with:
+
+```bash
+sudo ./xubuntu/26.04/install.sh
 sudo poweroff
 ```
 
@@ -25,13 +34,17 @@ wget -qO- 'https://gh-proxy.com/https://raw.githubusercontent.com/OldSuns/linux-
 
 The proxy only accelerates the script download. Package installation still uses the Ubuntu repositories configured on the VM.
 
-After installation completes, fully power off the VM. Then run this in an elevated PowerShell terminal on the Hyper-V host:
+After installation completes, fully power off the VM. Then run these commands in an elevated PowerShell terminal on the Hyper-V host. The guest Bash script cannot change these host settings:
 
 ```powershell
+Set-VMHost -EnableEnhancedSessionMode $true
 Set-VM -VMName '<vm-name>' -EnhancedSessionTransportType HvSocket
+
+Get-VMHost | Select-Object EnableEnhancedSessionMode
+Get-VM -VMName '<vm-name>' | Select-Object Name, EnhancedSessionTransportType
 ```
 
-Start the VM again and connect with `vmconnect.exe`.
+The expected values are `EnableEnhancedSessionMode = True` and `EnhancedSessionTransportType = HvSocket`. Start the VM again and connect with `vmconnect.exe`.
 
 # FAQ
 Frequently Asked Questions for this repo can be found on the [repo wiki](https://github.com/Microsoft/linux-vm-tools/wiki/FAQ).
