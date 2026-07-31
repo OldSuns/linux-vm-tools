@@ -5,6 +5,206 @@
 
 set -euo pipefail
 
+backup_once() {
+    local file="$1"
+    local backup="${file}.linux-vm-tools.orig"
+
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+        return
+    fi
+
+    cp -a -- "$file" "$backup"
+}
+
+commit_temp_file() {
+    local file="$1"
+    local temp_file="$2"
+
+    if ! chown --reference="$file" "$temp_file" ||
+        ! chmod --reference="$file" "$temp_file" ||
+        ! mv -f -- "$temp_file" "$file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+}
+
+edit_ini_value() {
+    local file="$1"
+    local section="$2"
+    local key="$3"
+    local operation="$4"
+    local value="${5:-}"
+    local temp_file
+
+    case "$key" in
+        *[!A-Za-z0-9_]*)
+            echo "Unsupported INI key: $key" >&2
+            return 1
+            ;;
+    esac
+
+    case "$operation" in
+        set|remove) ;;
+        *)
+            echo "Unsupported INI operation: $operation" >&2
+            return 1
+            ;;
+    esac
+
+    temp_file="$(mktemp "${file}.linux-vm-tools.XXXXXX")"
+    if ! awk \
+        -v target_section="$section" \
+        -v key="$key" \
+        -v operation="$operation" \
+        -v value="$value" '
+        function section_name(line, name) {
+            name = line
+            sub(/^[[:space:]]*\[/, "", name)
+            sub(/\][[:space:]]*$/, "", name)
+            return name
+        }
+
+        BEGIN {
+            in_target = 0
+            section_count = 0
+            key_count = 0
+        }
+
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            if (in_target && key_count == 0 && operation == "set") {
+                print key "=" value
+            }
+
+            in_target = section_name($0) == target_section
+            if (in_target) {
+                section_count++
+            }
+
+            print
+            next
+        }
+
+        in_target && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            key_count++
+            if (operation == "set") {
+                print key "=" value
+            }
+            next
+        }
+
+        { print }
+
+        END {
+            if (in_target && key_count == 0 && operation == "set") {
+                print key "=" value
+            }
+
+            if (section_count != 1 || (operation == "set" && key_count > 1)) {
+                exit 1
+            }
+        }
+    ' "$file" > "$temp_file"; then
+        rm -f -- "$temp_file"
+        echo "Could not $operation [$section] $key in $file" >&2
+        return 1
+    fi
+
+    commit_temp_file "$file" "$temp_file"
+}
+
+set_ini_value() {
+    edit_ini_value "$1" "$2" "$3" set "$4"
+}
+
+remove_ini_value() {
+    edit_ini_value "$1" "$2" "$3" remove
+}
+
+set_file_value() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    local temp_file
+
+    case "$key" in
+        *[!A-Za-z0-9_]*)
+            echo "Unsupported setting key: $key" >&2
+            return 1
+            ;;
+    esac
+
+    temp_file="$(mktemp "${file}.linux-vm-tools.XXXXXX")"
+    if ! awk -v key="$key" -v value="$value" '
+        BEGIN { key_count = 0 }
+
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            key_count++
+            print key "=" value
+            next
+        }
+
+        { print }
+
+        END {
+            if (key_count == 0) {
+                print key "=" value
+            } else if (key_count > 1) {
+                exit 1
+            }
+        }
+    ' "$file" > "$temp_file"; then
+        rm -f -- "$temp_file"
+        echo "Could not set $key in $file" >&2
+        return 1
+    fi
+
+    commit_temp_file "$file" "$temp_file"
+}
+
+ensure_line() {
+    local file="$1"
+    local line="$2"
+    local grep_status
+    local temp_file
+
+    grep -qxF -- "$line" "$file" && return
+    grep_status=$?
+    if [ "$grep_status" -ne 1 ]; then
+        return "$grep_status"
+    fi
+
+    temp_file="$(mktemp "${file}.linux-vm-tools.XXXXXX")"
+    if ! awk -v line="$line" '{ print } END { print line }' "$file" > "$temp_file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+
+    commit_temp_file "$file" "$temp_file"
+}
+
+ensure_symlink() {
+    local source="$1"
+    local target="$2"
+    local current_target
+
+    if [ -L "$target" ]; then
+        current_target="$(readlink "$target")"
+        if [ "$current_target" = "$source" ]; then
+            return
+        fi
+
+        ln -sfn -- "$source" "$target"
+        return
+    fi
+
+    if [ -e "$target" ]; then
+        echo "$target exists and is not a symbolic link" >&2
+        return 1
+    fi
+
+    ln -s -- "$source" "$target"
+}
+
 if [ "$(id -u)" -ne 0 ]; then
     echo 'This script must be run with root privileges' >&2
     exit 1
@@ -19,152 +219,172 @@ apt-get update
 # backend and polkitd-pkla package have been dropped).
 # gnome-keyring + libpam-gnome-keyring provide pam_gnome_keyring.so for
 # auto-unlocking the secret store when logging into the Xfce session.
-# xfce4-goodies adds extra panel plugins, thunar extensions, and themes.
-# yaru-theme-* and fonts-ubuntu give the session a native Ubuntu look.
+# xfce4-goodies adds extra panel plugins and Thunar extensions. Epiphany is a
+# native deb browser and avoids the snap confinement problems seen in xrdp.
 apt-get install -y \
     linux-tools-virtual linux-cloud-tools-virtual \
     xrdp xorgxrdp xfce4 xfce4-goodies xfce4-whiskermenu-plugin \
-    gnome-keyring libpam-gnome-keyring \
-    yaru-theme-gtk yaru-theme-icon yaru-theme-sound \
-    fonts-ubuntu gnome-themes-extra
+    xfce4-notifyd xfce4-power-manager xfce4-pulseaudio-plugin \
+    dbus-x11 dbus-user-session gnome-keyring libpam-gnome-keyring \
+    xdg-desktop-portal xdg-desktop-portal-gtk epiphany-browser \
+    greybird-gtk-theme elementary-xfce-icon-theme \
+    fonts-noto-core fonts-noto-mono \
+    ubuntu-wallpapers
 
 # Fix hypervkvpd journal errors: the daemon looks for these helpers in
 # /usr/libexec/hypervkvpd/ but Ubuntu ships them in /usr/sbin/.
 if [ -x /usr/sbin/hv_get_dhcp_info ]; then
     mkdir -p /usr/libexec/hypervkvpd
-    [ -e /usr/libexec/hypervkvpd/hv_get_dhcp_info ] \
-        || ln -s /usr/sbin/hv_get_dhcp_info /usr/libexec/hypervkvpd/hv_get_dhcp_info
+    ensure_symlink \
+        /usr/sbin/hv_get_dhcp_info \
+        /usr/libexec/hypervkvpd/hv_get_dhcp_info
 fi
 if [ -x /usr/sbin/hv_get_dns_info ]; then
     mkdir -p /usr/libexec/hypervkvpd
-    [ -e /usr/libexec/hypervkvpd/hv_get_dns_info ] \
-        || ln -s /usr/sbin/hv_get_dns_info /usr/libexec/hypervkvpd/hv_get_dns_info
+    ensure_symlink \
+        /usr/sbin/hv_get_dns_info \
+        /usr/libexec/hypervkvpd/hv_get_dns_info
 fi
 
-systemctl stop xrdp xrdp-sesman
+# Use the compatibility profile supported by Ubuntu's xrdp package. Hyper-V
+# sockets are host-local, so Enhanced Session Mode does not expose a TCP port.
+backup_once /etc/xrdp/xrdp.ini
+remove_ini_value /etc/xrdp/xrdp.ini Globals vmconnect
+set_ini_value /etc/xrdp/xrdp.ini Globals port 'vsock://-1:3389'
+set_ini_value /etc/xrdp/xrdp.ini Globals security_layer rdp
+set_ini_value /etc/xrdp/xrdp.ini Globals crypt_level none
+set_ini_value /etc/xrdp/xrdp.ini Globals bitmap_compression false
+set_ini_value /etc/xrdp/xrdp.ini Globals default_dpi 120
 
-# Use Hyper-V sockets and plain RDP security for Enhanced Session Mode.
-sed -i_orig -E \
-    -e '0,/^port=/{s|^port=.*$|port=vsock://-1:3389|}' \
-    -e 's|^security_layer=.*$|security_layer=rdp|' \
-    -e 's|^crypt_level=.*$|crypt_level=none|' \
-    -e 's|^bitmap_compression=.*$|bitmap_compression=false|' \
-    /etc/xrdp/xrdp.ini
-
-# Enable Hyper-V vmconnect support (xrdp >= 0.10.4).  This allows wider
-# security protocol support when connected via vmconnect.exe over vsock.
-if ! grep -q '^vmconnect=true' /etc/xrdp/xrdp.ini; then
-    sed -i '/^port=vsock:/a vmconnect=true' /etc/xrdp/xrdp.ini
-fi
-
-cat > /etc/xrdp/startxfce.sh <<'EOF'
+startxfce_temp="$(mktemp /etc/xrdp/startxfce.sh.linux-vm-tools.XXXXXX)"
+trap 'rm -f -- "$startxfce_temp"' EXIT
+cat > "$startxfce_temp" <<'EOF'
 #!/bin/sh
-# Clear inherited Wayland environment from the GNOME/GDM login session.
-# Ubuntu 26.04 uses GNOME 50 (Wayland-only).  When xrdp-sesman starts via
-# PAM, it connects to the user's existing systemd --user instance which
-# already has WAYLAND_DISPLAY set by GDM.  Merely unsetting in this shell
-# is insufficient because D-Bus-activated services (xfce4-notifyd, etc.)
-# inherit from the D-Bus activation environment, not the shell.
+set -eu
+
+# A systemd user manager and its D-Bus activation environment are shared by
+# all sessions for the same account. Refuse to overwrite an active local
+# graphical session with Xfce/X11 values.
+current_session="${XDG_SESSION_ID:-}"
+if [ -z "$current_session" ]; then
+    echo 'xrdp session has no logind session ID' >&2
+    exit 1
+fi
+
+sessions="$(loginctl show-user "$(id -u)" --property=Sessions --value)"
+for session in $sessions; do
+    if [ "$session" = "$current_session" ]; then
+        continue
+    fi
+
+    session_type="$(loginctl show-session "$session" --property=Type --value)"
+    case "$session_type" in
+        x11|wayland)
+            echo 'Log out other graphical sessions before starting xrdp' >&2
+            exit 1
+            ;;
+    esac
+done
+
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 export XDG_SESSION_TYPE=x11
+export XDG_SESSION_DESKTOP=xfce
 export XDG_CURRENT_DESKTOP=XFCE
+export DESKTOP_SESSION=xfce
 export GDK_BACKEND=x11
 export QT_QPA_PLATFORM=xcb
-# Ensure snap applications can find the user runtime directory.
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-# Remove Wayland variables from systemd user environment and update D-Bus
-# activation environment so D-Bus-activated services get the cleaned env.
-systemctl --user unset-environment WAYLAND_DISPLAY WAYLAND_SOCKET 2>/dev/null || true
-dbus-update-activation-environment \
-    DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP GDK_BACKEND QT_QPA_PLATFORM \
-    XDG_RUNTIME_DIR \
-    2>/dev/null || true
-exec startxfce4
-EOF
-chmod 755 /etc/xrdp/startxfce.sh
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 
-sed -i_orig -E \
-    -e 's|^UserWindowManager=.*$|UserWindowManager=startxfce.sh|' \
-    -e 's|^DefaultWindowManager=.*$|DefaultWindowManager=startxfce.sh|' \
-    -e 's|^FuseMountName=.*$|FuseMountName=shared-drives|' \
-    /etc/xrdp/sesman.ini
-
-if [ -f /etc/X11/Xwrapper.config ]; then
-    sed -i_orig -E 's|^allowed_users=.*$|allowed_users=anybody|' /etc/X11/Xwrapper.config
-else
-    echo 'allowed_users=anybody' > /etc/X11/Xwrapper.config
+if [ ! -S "$XDG_RUNTIME_DIR/bus" ]; then
+    echo "User D-Bus socket is missing: $XDG_RUNTIME_DIR/bus" >&2
+    exit 1
 fi
 
-# Suppress "Authentication required to create managed color device" popups in
-# remote xrdp sessions.  Ubuntu 26.04 uses polkit 127 with the JavaScript
-# rules engine, so we write a .rules file instead of a legacy .pkla file.
-mkdir -p /etc/polkit-1/rules.d/
-cat > /etc/polkit-1/rules.d/45-allow-colord.rules <<'EOF'
-polkit.addRule(function(action, subject) {
-    if ((action.id == "org.freedesktop.color-manager.create-device" ||
-         action.id == "org.freedesktop.color-manager.create-profile" ||
-         action.id == "org.freedesktop.color-manager.delete-device" ||
-         action.id == "org.freedesktop.color-manager.delete-profile" ||
-         action.id == "org.freedesktop.color-manager.modify-device" ||
-         action.id == "org.freedesktop.color-manager.modify-profile") &&
-        subject.isInGroup("users"))
-    {
-        return polkit.Result.YES;
-    }
-});
+WAYLAND_DISPLAY= WAYLAND_SOCKET= \
+dbus-update-activation-environment --systemd \
+    WAYLAND_DISPLAY WAYLAND_SOCKET DBUS_SESSION_BUS_ADDRESS DISPLAY XAUTHORITY \
+    XDG_SESSION_TYPE XDG_SESSION_DESKTOP \
+    XDG_CURRENT_DESKTOP DESKTOP_SESSION GDK_BACKEND QT_QPA_PLATFORM \
+    XDG_RUNTIME_DIR
+systemctl --user unset-environment WAYLAND_DISPLAY WAYLAND_SOCKET
+
+# Run Debian's standard X11 session initialization before starting Xfce. This
+# loads locale, Xresources, accessibility, D-Bus and portal integration.
+exec /etc/X11/Xsession startxfce4
 EOF
+chown root:root "$startxfce_temp"
+chmod 755 "$startxfce_temp"
+mv -f -- "$startxfce_temp" /etc/xrdp/startxfce.sh
+trap - EXIT
+
+backup_once /etc/xrdp/sesman.ini
+set_ini_value /etc/xrdp/sesman.ini Globals UserWindowManager startxfce.sh
+set_ini_value /etc/xrdp/sesman.ini Globals DefaultWindowManager startxfce.sh
+set_ini_value /etc/xrdp/sesman.ini Chansrv FuseMountName shared-drives
+
+if [ -f /etc/X11/Xwrapper.config ]; then
+    backup_once /etc/X11/Xwrapper.config
+    set_file_value /etc/X11/Xwrapper.config allowed_users anybody
+else
+    printf '%s\n' 'allowed_users=anybody' > /etc/X11/Xwrapper.config
+fi
 
 usermod -aG ssl-cert xrdp
 
-# Auto-unlock GNOME keyring on xrdp login (Xfce uses it for secret storage).
-# The leading '-' on optional lines makes PAM skip a missing module silently.
-if [ -f /etc/pam.d/xrdp-sesman ] && [ ! -f /etc/pam.d/xrdp-sesman.orig ]; then
-    cp -p /etc/pam.d/xrdp-sesman /etc/pam.d/xrdp-sesman.orig
-fi
-cat > /etc/pam.d/xrdp-sesman <<'EOF'
-#%PAM-1.0
-auth     required  pam_env.so readenv=1
-auth     required  pam_env.so readenv=1 envfile=/etc/default/locale
-@include common-auth
--auth    optional  pam_gnome_keyring.so
+# Preserve the package-managed PAM stack and add only the optional keyring
+# hooks needed by the Xfce session.
+test -f /etc/pam.d/xrdp-sesman
+backup_once /etc/pam.d/xrdp-sesman
+ensure_line /etc/pam.d/xrdp-sesman '-auth optional pam_gnome_keyring.so'
+ensure_line /etc/pam.d/xrdp-sesman '-session optional pam_gnome_keyring.so auto_start'
 
-@include common-account
-@include common-password
-
-session    required     pam_limits.so
-session    required     pam_loginuid.so
-session    optional     pam_lastlog.so quiet
-@include common-session
--session optional  pam_gnome_keyring.so auto_start
-EOF
+# Xfce launchers use this helper instead of invoking a browser directly.
+test -f /etc/xdg/xfce4/helpers.rc
+backup_once /etc/xdg/xfce4/helpers.rc
+set_file_value /etc/xdg/xfce4/helpers.rc WebBrowser epiphany
 
 echo 'blacklist vmw_vsock_vmci_transport' > /etc/modprobe.d/blacklist-vmw_vsock_vmci_transport.conf
 echo 'hv_sock' > /etc/modules-load.d/hv_sock.conf
 modprobe hv_sock
 
-# Apply Yaru theme system-wide for Xfce sessions.
-# We only set theme/appearance properties, NOT panel layout — let Xfce
-# use its own default panel which is fully functional out of the box.
+# Apply coherent Xfce-native defaults. Yaru does not provide matching xfwm4
+# decorations, which results in undersized borders and inconsistent scaling.
 mkdir -p /etc/xdg/xfce4/xfconf/xfce-perchannel-xml
 cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
-<channel name="xsettings">
+<channel name="xsettings" version="1.0">
   <property name="Net" type="empty">
-    <property name="ThemeName" type="string" value="Yaru"/>
-    <property name="IconThemeName" type="string" value="Yaru"/>
+    <property name="ThemeName" type="string" value="Greybird"/>
+    <property name="IconThemeName" type="string" value="elementary-xfce"/>
+  </property>
+  <property name="Xft" type="empty">
+    <property name="DPI" type="int" value="120"/>
+    <property name="Antialias" type="int" value="1"/>
+    <property name="Hinting" type="int" value="1"/>
+    <property name="HintStyle" type="string" value="hintslight"/>
+    <property name="RGBA" type="string" value="rgb"/>
   </property>
   <property name="Gtk" type="empty">
-    <property name="FontName" type="string" value="Ubuntu 11"/>
-    <property name="MonospaceFontName" type="string" value="Ubuntu Mono 13"/>
-    <property name="CursorThemeName" type="string" value="Yaru"/>
+    <property name="FontName" type="string" value="Noto Sans 10"/>
+    <property name="MonospaceFontName" type="string" value="Noto Sans Mono 10"/>
+    <property name="CursorThemeName" type="string" value="DMZ-White"/>
+    <property name="CursorThemeSize" type="int" value="24"/>
+    <property name="DecorationLayout" type="string" value="menu:minimize,maximize,close"/>
   </property>
 </channel>
 EOF
 cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfwm4">
+<channel name="xfwm4" version="1.0">
   <property name="general" type="empty">
-    <property name="theme" type="string" value="Yaru"/>
+    <property name="theme" type="string" value="Greybird"/>
+    <property name="title_font" type="string" value="Noto Sans Bold 10"/>
+    <property name="button_layout" type="string" value="O|HMC"/>
+    <property name="box_move" type="bool" value="false"/>
+    <property name="box_resize" type="bool" value="false"/>
+    <property name="use_compositing" type="bool" value="true"/>
+    <property name="workspace_count" type="int" value="1"/>
   </property>
 </channel>
 EOF
@@ -182,59 +402,112 @@ cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'EOF'
 </channel>
 EOF
 
-systemctl daemon-reload
+mkdir -p /etc/xdg/xfce4/panel
+cat > /etc/xdg/xfce4/panel/default.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-panel" version="1.0">
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+    <property name="panel-1" type="empty">
+      <property name="position" type="string" value="p=8;x=0;y=0"/>
+      <property name="length" type="uint" value="100"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="size" type="uint" value="36"/>
+      <property name="plugin-ids" type="array">
+        <value type="int" value="1"/>
+        <value type="int" value="2"/>
+        <value type="int" value="3"/>
+        <value type="int" value="4"/>
+        <value type="int" value="5"/>
+        <value type="int" value="6"/>
+        <value type="int" value="7"/>
+      </property>
+    </property>
+  </property>
+  <property name="plugins" type="empty">
+    <property name="plugin-1" type="string" value="whiskermenu"/>
+    <property name="plugin-2" type="string" value="tasklist">
+      <property name="flat-buttons" type="bool" value="true"/>
+      <property name="show-handle" type="bool" value="false"/>
+    </property>
+    <property name="plugin-3" type="string" value="separator">
+      <property name="expand" type="bool" value="true"/>
+      <property name="style" type="uint" value="0"/>
+    </property>
+    <property name="plugin-4" type="string" value="systray">
+      <property name="show-frame" type="bool" value="false"/>
+      <property name="square-icons" type="bool" value="true"/>
+    </property>
+    <property name="plugin-5" type="string" value="notification-plugin"/>
+    <property name="plugin-6" type="string" value="pulseaudio"/>
+    <property name="plugin-7" type="string" value="clock">
+      <property name="digital-format" type="string" value=" %m-%d %H:%M "/>
+    </property>
+  </property>
+  <property name="configver" type="int" value="2"/>
+</channel>
+EOF
+
 systemctl enable xrdp xrdp-sesman
 systemctl restart xrdp-sesman xrdp
 
 # Fail rather than reporting success when a package or setting is missing.
-for package in xrdp xorgxrdp xfce4 xfce4-goodies; do
+for package in \
+    xrdp xorgxrdp xfce4 xfce4-goodies dbus-x11 dbus-user-session \
+    epiphany-browser xdg-desktop-portal-gtk greybird-gtk-theme \
+    elementary-xfce-icon-theme; do
     dpkg-query -W -f='${Status}\n' "$package" | grep -qxF 'install ok installed'
 done
 command -v startxfce4 > /dev/null
+command -v dbus-update-activation-environment > /dev/null
 test -x /etc/xrdp/startxfce.sh
+grep -qxF 'dbus-update-activation-environment --systemd \' /etc/xrdp/startxfce.sh
+grep -qxF 'exec /etc/X11/Xsession startxfce4' /etc/xrdp/startxfce.sh
 grep -qxF 'port=vsock://-1:3389' /etc/xrdp/xrdp.ini
-grep -qxF 'vmconnect=true' /etc/xrdp/xrdp.ini
 grep -qxF 'security_layer=rdp' /etc/xrdp/xrdp.ini
 grep -qxF 'crypt_level=none' /etc/xrdp/xrdp.ini
 grep -qxF 'bitmap_compression=false' /etc/xrdp/xrdp.ini
+grep -qxF 'default_dpi=120' /etc/xrdp/xrdp.ini
+if grep -Eq '^[[:space:]]*vmconnect[[:space:]]*=' /etc/xrdp/xrdp.ini; then
+    echo 'Unsupported vmconnect setting remains in /etc/xrdp/xrdp.ini' >&2
+    exit 1
+fi
 grep -qxF 'UserWindowManager=startxfce.sh' /etc/xrdp/sesman.ini
 grep -qxF 'DefaultWindowManager=startxfce.sh' /etc/xrdp/sesman.ini
+grep -qxF 'FuseMountName=shared-drives' /etc/xrdp/sesman.ini
 for service in xrdp xrdp-sesman; do
     systemctl is-active --quiet "$service"
 done
 for service in xrdp xrdp-sesman; do
     systemctl is-enabled --quiet "$service"
 done
-# Colord polkit policy present.
-test -f /etc/polkit-1/rules.d/45-allow-colord.rules
+# Use the policy shipped and maintained by the xrdp package.
+test -f /usr/share/polkit-1/rules.d/xrdp-colord.rules
 # Xwrapper allows any user.
 grep -qxF 'allowed_users=anybody' /etc/X11/Xwrapper.config
 # xrdp is in the ssl-cert group.
 id -nG xrdp | grep -qw ssl-cert
 # hv_sock is loaded.
-lsmod | grep -q hv_sock
+test -d /sys/module/hv_sock
 # hypervkvpd symlinks exist (only checked when the source binaries are present).
 if [ -x /usr/sbin/hv_get_dhcp_info ]; then
-    test -e /usr/libexec/hypervkvpd/hv_get_dhcp_info
+    test "$(readlink /usr/libexec/hypervkvpd/hv_get_dhcp_info)" = \
+        /usr/sbin/hv_get_dhcp_info
 fi
 if [ -x /usr/sbin/hv_get_dns_info ]; then
-    test -e /usr/libexec/hypervkvpd/hv_get_dns_info
+    test "$(readlink /usr/libexec/hypervkvpd/hv_get_dns_info)" = \
+        /usr/sbin/hv_get_dns_info
 fi
 # PAM keyring auto-unlock configured.
-grep -q 'pam_gnome_keyring.so' /etc/pam.d/xrdp-sesman
-# Yaru theme packages installed.
-for package in yaru-theme-gtk yaru-theme-icon; do
-    dpkg-query -W -f='${Status}\n' "$package" | grep -qxF 'install ok installed'
-done
+grep -qxF -- '-auth optional pam_gnome_keyring.so' /etc/pam.d/xrdp-sesman
+grep -qxF -- '-session optional pam_gnome_keyring.so auto_start' /etc/pam.d/xrdp-sesman
+grep -qxF 'WebBrowser=epiphany' /etc/xdg/xfce4/helpers.rc
 # Xfce system-wide theme defaults present.
 test -f /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
 test -f /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 test -f /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+test -f /etc/xdg/xfce4/panel/default.xml
+test -f /usr/share/backgrounds/warty-final-ubuntu.png
 
 echo 'Install is complete.'
 echo 'Fully power off the VM, set EnhancedSessionTransportType to HvSocket on the host, then start it again.'
-echo ''
-echo 'NOTE: If Firefox (snap) does not launch in the xrdp session, run:'
-echo '  snap remove firefox'
-echo '  snap install firefox --classic'
-echo 'Or install a non-snap browser: sudo apt install epiphany-browser'
