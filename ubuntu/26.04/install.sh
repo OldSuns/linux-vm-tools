@@ -47,6 +47,12 @@ sed -i_orig -E \
     -e 's|^bitmap_compression=.*$|bitmap_compression=false|' \
     /etc/xrdp/xrdp.ini
 
+# Enable Hyper-V vmconnect support (xrdp >= 0.10.4).  This allows wider
+# security protocol support when connected via vmconnect.exe over vsock.
+if ! grep -q '^vmconnect=true' /etc/xrdp/xrdp.ini; then
+    sed -i '/^port=vsock:/a vmconnect=true' /etc/xrdp/xrdp.ini
+fi
+
 cat > /etc/xrdp/startxfce.sh <<'EOF'
 #!/bin/sh
 exec startxfce4
@@ -113,7 +119,7 @@ echo 'hv_sock' > /etc/modules-load.d/hv_sock.conf
 modprobe hv_sock
 
 systemctl daemon-reload
-systemctl enable xrdp
+systemctl enable xrdp xrdp-sesman
 systemctl restart xrdp-sesman xrdp
 
 # Fail rather than reporting success when a package or setting is missing.
@@ -123,6 +129,7 @@ done
 command -v startxfce4 > /dev/null
 test -x /etc/xrdp/startxfce.sh
 grep -qxF 'port=vsock://-1:3389' /etc/xrdp/xrdp.ini
+grep -qxF 'vmconnect=true' /etc/xrdp/xrdp.ini
 grep -qxF 'security_layer=rdp' /etc/xrdp/xrdp.ini
 grep -qxF 'crypt_level=none' /etc/xrdp/xrdp.ini
 grep -qxF 'bitmap_compression=false' /etc/xrdp/xrdp.ini
@@ -130,6 +137,9 @@ grep -qxF 'UserWindowManager=startxfce.sh' /etc/xrdp/sesman.ini
 grep -qxF 'DefaultWindowManager=startxfce.sh' /etc/xrdp/sesman.ini
 for service in xrdp xrdp-sesman; do
     systemctl is-active --quiet "$service"
+done
+for service in xrdp xrdp-sesman; do
+    systemctl is-enabled --quiet "$service"
 done
 # Colord polkit policy present.
 test -f /etc/polkit-1/rules.d/45-allow-colord.rules
