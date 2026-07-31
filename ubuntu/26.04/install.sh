@@ -19,10 +19,14 @@ apt-get update
 # backend and polkitd-pkla package have been dropped).
 # gnome-keyring + libpam-gnome-keyring provide pam_gnome_keyring.so for
 # auto-unlocking the secret store when logging into the Xfce session.
+# xfce4-goodies adds extra panel plugins, thunar extensions, and themes.
+# yaru-theme-* and fonts-ubuntu give the session a native Ubuntu look.
 apt-get install -y \
     linux-tools-virtual linux-cloud-tools-virtual \
-    xrdp xorgxrdp xfce4 \
-    gnome-keyring libpam-gnome-keyring
+    xrdp xorgxrdp xfce4 xfce4-goodies xfce4-whiskermenu-plugin \
+    gnome-keyring libpam-gnome-keyring \
+    yaru-theme-gtk yaru-theme-icon yaru-theme-sound \
+    fonts-ubuntu gnome-themes-extra
 
 # Fix hypervkvpd journal errors: the daemon looks for these helpers in
 # /usr/libexec/hypervkvpd/ but Ubuntu ships them in /usr/sbin/.
@@ -66,11 +70,14 @@ export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=XFCE
 export GDK_BACKEND=x11
 export QT_QPA_PLATFORM=xcb
+# Ensure snap applications can find the user runtime directory.
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 # Remove Wayland variables from systemd user environment and update D-Bus
 # activation environment so D-Bus-activated services get the cleaned env.
 systemctl --user unset-environment WAYLAND_DISPLAY WAYLAND_SOCKET 2>/dev/null || true
 dbus-update-activation-environment \
     DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP GDK_BACKEND QT_QPA_PLATFORM \
+    XDG_RUNTIME_DIR \
     2>/dev/null || true
 exec startxfce4
 EOF
@@ -135,12 +142,52 @@ echo 'blacklist vmw_vsock_vmci_transport' > /etc/modprobe.d/blacklist-vmw_vsock_
 echo 'hv_sock' > /etc/modules-load.d/hv_sock.conf
 modprobe hv_sock
 
+# Apply Yaru theme system-wide for Xfce sessions.
+# We only set theme/appearance properties, NOT panel layout — let Xfce
+# use its own default panel which is fully functional out of the box.
+mkdir -p /etc/xdg/xfce4/xfconf/xfce-perchannel-xml
+cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xsettings">
+  <property name="Net" type="empty">
+    <property name="ThemeName" type="string" value="Yaru"/>
+    <property name="IconThemeName" type="string" value="Yaru"/>
+  </property>
+  <property name="Gtk" type="empty">
+    <property name="FontName" type="string" value="Ubuntu 11"/>
+    <property name="MonospaceFontName" type="string" value="Ubuntu Mono 13"/>
+    <property name="CursorThemeName" type="string" value="Yaru"/>
+  </property>
+</channel>
+EOF
+cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4">
+  <property name="general" type="empty">
+    <property name="theme" type="string" value="Yaru"/>
+  </property>
+</channel>
+EOF
+cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitor0" type="empty">
+        <property name="image-path" type="string" value="/usr/share/backgrounds/warty-final-ubuntu.png"/>
+        <property name="image-style" type="int" value="3"/>
+      </property>
+    </property>
+  </property>
+</channel>
+EOF
+
 systemctl daemon-reload
 systemctl enable xrdp xrdp-sesman
 systemctl restart xrdp-sesman xrdp
 
 # Fail rather than reporting success when a package or setting is missing.
-for package in xrdp xorgxrdp xfce4; do
+for package in xrdp xorgxrdp xfce4 xfce4-goodies; do
     dpkg-query -W -f='${Status}\n' "$package" | grep -qxF 'install ok installed'
 done
 command -v startxfce4 > /dev/null
@@ -175,6 +222,19 @@ if [ -x /usr/sbin/hv_get_dns_info ]; then
 fi
 # PAM keyring auto-unlock configured.
 grep -q 'pam_gnome_keyring.so' /etc/pam.d/xrdp-sesman
+# Yaru theme packages installed.
+for package in yaru-theme-gtk yaru-theme-icon; do
+    dpkg-query -W -f='${Status}\n' "$package" | grep -qxF 'install ok installed'
+done
+# Xfce system-wide theme defaults present.
+test -f /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+test -f /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+test -f /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
 
 echo 'Install is complete.'
 echo 'Fully power off the VM, set EnhancedSessionTransportType to HvSocket on the host, then start it again.'
+echo ''
+echo 'NOTE: If Firefox (snap) does not launch in the xrdp session, run:'
+echo '  snap remove firefox'
+echo '  snap install firefox --classic'
+echo 'Or install a non-snap browser: sudo apt install epiphany-browser'
