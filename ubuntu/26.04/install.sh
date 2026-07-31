@@ -55,11 +55,23 @@ fi
 
 cat > /etc/xrdp/startxfce.sh <<'EOF'
 #!/bin/sh
-# Clear inherited Wayland environment from the GNOME login session.
-unset WAYLAND_DISPLAY
-unset XDG_SESSION_TYPE
+# Clear inherited Wayland environment from the GNOME/GDM login session.
+# Ubuntu 26.04 uses GNOME 50 (Wayland-only).  When xrdp-sesman starts via
+# PAM, it connects to the user's existing systemd --user instance which
+# already has WAYLAND_DISPLAY set by GDM.  Merely unsetting in this shell
+# is insufficient because D-Bus-activated services (xfce4-notifyd, etc.)
+# inherit from the D-Bus activation environment, not the shell.
+unset WAYLAND_DISPLAY WAYLAND_SOCKET
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=XFCE
+export GDK_BACKEND=x11
+export QT_QPA_PLATFORM=xcb
+# Remove Wayland variables from systemd user environment and update D-Bus
+# activation environment so D-Bus-activated services get the cleaned env.
+systemctl --user unset-environment WAYLAND_DISPLAY WAYLAND_SOCKET 2>/dev/null || true
+dbus-update-activation-environment \
+    DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP GDK_BACKEND QT_QPA_PLATFORM \
+    2>/dev/null || true
 exec startxfce4
 EOF
 chmod 755 /etc/xrdp/startxfce.sh
